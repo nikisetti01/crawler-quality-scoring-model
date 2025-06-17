@@ -1,0 +1,3 @@
+#ignore file csv
+# Ignore CSV files
+*.csv
