@@ -20,16 +20,19 @@ from tqdm import tqdm
 # -----------------------------
 # Args
 # -----------------------------
+# Evaluation entrypoint:
+# - select architecture branch (BERT vs QualT5 decoder)
+# - provide checkpoint, tokenized test directory, and compute/IO budget.
 parser = argparse.ArgumentParser()
 parser.add_argument("--arch", type=str, choices=["bert", "qt5"], required=True,
-                    help="Scegli quale architettura valutare: 'bert' o 'qt5'")
+                    help="Select evaluation branch: 'bert' or 'qt5'.")
 parser.add_argument("--model_name", type=str, default="bert-base-uncased",
-                    help="Per BERT: nome modello HF dell'encoder. Per QT5 puoi ignorarlo.")
-parser.add_argument("--ckpt", type=str, required=True, help="Path ai pesi .pt")
-parser.add_argument("--test_dir", type=str, required=True, help="Directory con tokenized_chunk_*")
-parser.add_argument("--chunks", type=int, default=2000)
-parser.add_argument("--batch_size", type=int, default=128)
-parser.add_argument("--num_workers", type=int, default=1)
+                    help="HF encoder name for BERT branch (ignored for QT5).")
+parser.add_argument("--ckpt", type=str, required=True, help="Path to .pt checkpoint.")
+parser.add_argument("--test_dir", type=str, required=True, help="Directory with tokenized_chunk_*")
+parser.add_argument("--chunks", type=int, default=2000, help="Max chunks to load.")
+parser.add_argument("--batch_size", type=int, default=128, help="Eval batch size.")
+parser.add_argument("--num_workers", type=int, default=1, help="DataLoader workers.")
 args = parser.parse_args()
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -38,6 +41,9 @@ print(f"✅ Using device: {DEVICE}")
 # -----------------------------
 # Dataset
 # -----------------------------
+# Thin wrapper around on-disk HF datasets:
+# - enforces tensor types
+# - provides sane defaults for optional fields (e.g., numerics, masks)
 class HFTokenizedDataset(Dataset):
     def __init__(self, hf_dataset):
         self.ds = hf_dataset
@@ -57,16 +63,17 @@ class HFTokenizedDataset(Dataset):
             "numerics":        torch.tensor(numerics, dtype=torch.float32),
             "label":           torch.tensor(int(it["label"]), dtype=torch.long),
         }
-        # decoder_labels opzionali (QT5)
+        # Optional seq2seq supervision for QT5 branch
         if "decoder_labels" in it and it["decoder_labels"] is not None and len(it["decoder_labels"])>0:
             out["decoder_labels"] = torch.tensor(it["decoder_labels"], dtype=torch.long)
         return out
 
 def load_dataset_concatenated(base_dir, n_chunks):
+    # Stream-friendly concatenation of many tokenized shards stored on disk.
     paths = [os.path.join(base_dir, f"tokenized_chunk_{i}") for i in range(n_chunks)]
     paths = [p for p in paths if os.path.exists(p)]
     if not paths:
-        raise FileNotFoundError(f"Nessun chunk trovato in {base_dir}")
+        raise FileNotFoundError(f"No chunk found in {base_dir}")
     dsets = [load_from_disk(p) for p in paths]
     return concatenate_datasets(dsets)
 
@@ -80,9 +87,11 @@ test_loader = DataLoader(HFTokenizedDataset(test_hf),
 # -----------------------------
 # Utilities
 # -----------------------------
+# Helper to detect whether checkpoint contains LoRA adapters (naming convention).
 def state_dict_has_lora_keys(sd):
     return any((".lora_A." in k) or (".lora_B." in k) for k in sd.keys())
 
+# Produce ROC and PR curves from scores; save to disk for reports.
 def make_pr_curves(y_true, y_score, roc_auc, pr_auc):
     fpr, tpr, _ = roc_curve(y_true, y_score)
     plt.figure()
@@ -99,6 +108,7 @@ def make_pr_curves(y_true, y_score, roc_auc, pr_auc):
     plt.title("Precision-Recall Curve"); plt.legend(); plt.grid(True)
     plt.savefig("pr_curve.png"); plt.close()
 
+# Print headline metrics and persist per-sample outputs for downstream analysis.
 def print_and_save_metrics(y_true, y_score, y_pred, out_csv="evaluation_results.csv"):
     print("\n📊 Metrics (threshold 0.5)")
     acc  = accuracy_score(y_true, y_pred)
@@ -129,6 +139,7 @@ def print_and_save_metrics(y_true, y_score, y_pred, out_csv="evaluation_results.
 # -----------------------------
 # Branch: BERT
 # -----------------------------
+# Encoder-only classifier + sigmoid scores. Supports optional LoRA loading.
 if args.arch == "bert":
     try:
         from model_bert import MultiModalWebClassifier
@@ -142,6 +153,7 @@ if args.arch == "bert":
     print(f"📦 Loading checkpoint: {args.ckpt}")
     state = torch.load(args.ckpt, map_location=DEVICE)
 
+    # If adapters were used during training, wrap encoder with PEFT before loading weights.
     if state_dict_has_lora_keys(state):
         print("🔗 Detected LoRA adapters in checkpoint → applying only to encoder")
         from peft import LoraConfig, get_peft_model
@@ -162,6 +174,7 @@ if args.arch == "bert":
     if unexpected: print(f"⚠️ Unexpected keys: {unexpected}")
     model.eval(); print("✅ Model ready (BERT).")
 
+    # Collect probabilistic outputs for thresholded metrics + curves.
     all_probs, all_labels = [], []
 
     with torch.no_grad():
@@ -193,9 +206,8 @@ if args.arch == "bert":
 # -----------------------------
 # Branch: QT5 (decoder generativo)
 # -----------------------------
-# model_qualt5_decoder deve esporre:
-# - domains_embedding, meta_encoder, uni_attn(attn_mask), prompt_mapper
-# - backbone T5 accessibile come model/t5/backbone (usiamo helper)
+# Seq2seq classifier driven by a metadata-conditioned prompt;
+# we score 'true' vs 'false' at the first decoding step.
 try:
     from model.model_qualt5_decoder import MultiModalWebClassifier
 except Exception:
@@ -204,12 +216,12 @@ except Exception:
 print("🧠 Building QT5 decoder model...")
 model = MultiModalWebClassifier().to(DEVICE)
 
-# helper backbone
+# Helper: retrieve the internal T5 backbone regardless of wrapper attribute name.
 def get_t5_backbone(m):
     for attr in ["model", "t5", "backbone", "base_model"]:
         if hasattr(m, attr):
             return getattr(m, attr)
-    raise AttributeError("Backbone T5 non trovato in MultiModalWebClassifier.")
+    raise AttributeError("Backbone T5 not found inside MultiModalWebClassifier.")
 
 print(f"📦 Loading checkpoint: {args.ckpt}")
 state = torch.load(args.ckpt, map_location=DEVICE)
@@ -218,15 +230,15 @@ if missing:   print(f"⚠️ Missing keys: {missing}")
 if unexpected: print(f"⚠️ Unexpected keys: {unexpected}")
 model.eval(); print("✅ Model ready (QT5).")
 
-# tokenizer per ricavare gli id di 'true'/'false'
+# Prepare single-token targets for scoring:
+# map the first-step logits to {'true','false'} and softmax within that subset.
 tok = AutoTokenizer.from_pretrained("pyterrier-quality/qt5-small", use_fast=True)
 true_ids  = tok("true",  add_special_tokens=False).input_ids
 false_ids = tok("false", add_special_tokens=False).input_ids
 if len(true_ids) == 0 or len(false_ids) == 0:
-    raise RuntimeError("Token 'true'/'false' non tokenizzabili—controlla il tokenizer.")
+    raise RuntimeError("Tokens 'true'/'false' not found—check tokenizer.")
 true_id, false_id = true_ids[0], false_ids[0]
 
-# Inference: prob_true via softmax(logit_true, logit_false)
 all_scores, all_labels = [], []
 
 with torch.no_grad():
@@ -234,35 +246,38 @@ with torch.no_grad():
         batch = {k: v.to(DEVICE) for k, v in batch.items()}
         t5 = get_t5_backbone(model)
 
-        # Encoder testo
+        # Text encoder
         enc = t5.encoder(
             input_ids=batch["input_ids"],
             attention_mask=batch["attention_mask"]
         )
         enc_hidden = enc.last_hidden_state
 
-        # Metadata → fusion
+        # Metadata fusion (domains/anchors/numerics → meta tokens → cross-modal attention)
         dom_out = model.domains_embedding(batch['domains_out_ids']).mean(dim=1)
         dom_in  = model.domains_embedding(batch['domains_in_ids']).mean(dim=1)
         meta_tokens = model.meta_encoder(
             batch['anchor_out_ids'], batch['anchor_in_ids'],
             dom_out, dom_in, batch['numerics']
         )
+
+        # Ensure boolean attention mask
         enc_mask = batch["attention_mask"]
         if enc_mask.dtype != torch.bool:
             enc_mask = enc_mask.bool()
+
         uni_out = model.uni_attn(meta_tokens, enc_hidden, enc_mask)
 
-        # Prompt (1 step decode)
+        # Prompt the decoder for a single step and score {true,false}
         prompt = model.prompt_mapper(uni_out.mean(dim=1)).unsqueeze(1)  # (B,1,H)
         out = t5(
             encoder_outputs=BaseModelOutput(last_hidden_state=enc_hidden),
             decoder_inputs_embeds=prompt,
             return_dict=True
         )
-        logits = out.logits[:, 0, :]  # (B, V), primo step
+        logits = out.logits[:, 0, :]                       # (B, V), first step
         sel = torch.stack([logits[:, true_id], logits[:, false_id]], dim=-1)  # (B,2)
-        probs = torch.softmax(sel, dim=-1)[:, 0]  # prob('true')
+        probs = torch.softmax(sel, dim=-1)[:, 0]           # P('true')
         scores = probs.detach().cpu().numpy()
 
         labels = batch["label"].detach().cpu().numpy()

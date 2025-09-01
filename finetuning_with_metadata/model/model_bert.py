@@ -1,474 +1,139 @@
-#!/usr/bin/env python3
-import os
-import argparse
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-from datasets import load_from_disk, concatenate_datasets
-from tqdm import tqdm
-import wandb
+from transformers import BertModel
 
-from accelerate import Accelerator
-from transformers import AutoModel, AutoTokenizer, BertTokenizerFast
-from transformers.modeling_outputs import BaseModelOutput
+HIDDEN_DIM = 128
+BERT_H = 768  # hidden size BERT base
 
-# =========================
-# Args & init
-# =========================
-parser = argparse.ArgumentParser()
-parser.add_argument("--model", type=str, default="pyterrier-quality/qt5-small",
-                    help="bert-base-uncased | pyterrier-quality/qt5-small | qt5_decoder")
-parser.add_argument("--max_steps_p1", type=int, default=25000)
-parser.add_argument("--max_steps_p2", type=int, default=10000)
-parser.add_argument("--qt5_train_dir", type=str,
-                    default="/mnt/ssd_data/tokenized_qt5_small_generative_train",
-                    help="Directory dei chunk train per qt5 generativo")
-parser.add_argument("--bert_train_dir", type=str,
-                    default="/mnt/ssd_data/tokenized_bert_train",
-                    help="Directory dei chunk train per BERT")
-parser.add_argument("--num_qt5_chunks", type=int, default=2000,
-                    help="Numero max chunk da considerare (qt5)")
-parser.add_argument("--num_bert_chunks", type=int, default=126,
-                    help="Numero max chunk da considerare (bert)")
-parser.add_argument("--seed", type=int, default=42)
-args = parser.parse_args()
 
-accelerator = Accelerator()
-device = accelerator.device
-print(f"Using device: {device}")
+class MetadataEncoder(nn.Module):
+    """
+    Encode heterogeneous metadata sources (anchors, domains, numerics)
+    into a unified hidden representation. Each feature type is projected
+    through a small feed-forward layer into the same hidden space.
+    """
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.anchor_encoder = nn.Sequential(nn.Linear(32, hidden_dim), nn.ReLU())
+        self.domain_proj    = nn.Sequential(nn.Linear(64, hidden_dim), nn.ReLU())
+        self.numeric_proj   = nn.Sequential(nn.Linear(8,  hidden_dim), nn.ReLU())
 
-model_name = args.model
-short_model = model_name.split("/")[-1].replace('-', '_')
+    def forward(self, anchor_out, anchor_in, domain_out, domain_in, numerics):
+        # Stack different metadata encodings along a pseudo-sequence axis
+        return torch.stack([
+            self.anchor_encoder(anchor_out.float()),   # outgoing anchors
+            self.anchor_encoder(anchor_in.float()),    # incoming anchors
+            self.domain_proj(domain_out.float()),      # outgoing domains
+            self.domain_proj(domain_in.float()),       # incoming domains
+            self.numeric_proj(numerics)                # numerical link stats
+        ], dim=1)  # shape [B, 5, H]
 
-# =========================
-# Tokenizer & Encoder selector
-# =========================
-if model_name == "qt5_decoder":
-    short_model = "qt5_small"
-    tokenizer = AutoTokenizer.from_pretrained("pyterrier-quality/qt5-small")
-    encoder = None
-elif model_name.startswith("pyterrier-quality/qt5-small"):
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    encoder = None
-else:
-    print(f"Using BERT tokenizer for {model_name}")
-    tokenizer = BertTokenizerFast.from_pretrained(model_name)
-    encoder = AutoModel.from_pretrained(model_name)
 
-print(f"Using model: {model_name} (short name: {short_model})")
+class AdditiveUniAttention(nn.Module):
+    """
+    Unified additive attention (Bahdanau-style) that aligns metadata tokens
+    with the textual representation. Each metadata token queries the entire
+    text sequence to extract relevant contextual information.
+    """
+    def __init__(self, meta_h=HIDDEN_DIM, txt_h=BERT_H, attn_h=64):
+        super().__init__()
+        self.Wq = nn.Linear(meta_h, attn_h, bias=True)   # project metadata tokens
+        self.Wk = nn.Linear(txt_h, attn_h, bias=True)    # project textual tokens
+        self.v  = nn.Linear(attn_h, 1, bias=True)        # scoring vector
+        self.Vv = nn.Linear(txt_h, meta_h, bias=True)    # project values into meta space
+        self.norm = nn.LayerNorm(meta_h)
+        self.dropout = nn.Dropout(0.1)
 
-# =========================
-# Dataset paths
-# =========================
-if "bert" in model_name:
-    CHUNK_TRAIN_PATHS = [
-        os.path.join(args.bert_train_dir, f"tokenized_chunk_{i}")
-        for i in range(args.num_bert_chunks)
-    ]
-else:
-    # qt5 generativo: usa SOLO i chunk di TRAIN e fai split 90/10 per validation
-    CHUNK_TRAIN_PATHS = [
-        os.path.join(args.qt5_train_dir, f"tokenized_chunk_{i}")
-        for i in range(args.num_qt5_chunks)
-    ]
+    def forward(self, meta_tokens, bert_hidden, bert_attn_mask):
+        """
+        meta_tokens: metadata sequence [B, M, H]
+        bert_hidden: contextual text embeddings [B, L, BERT_H]
+        bert_attn_mask: mask for text padding [B, L]
+        return: metadata tokens enriched with textual context [B, M, H]
+        """
+        B, M, H = meta_tokens.size()
+        L = bert_hidden.size(1)
 
-CHUNK_TRAIN_PATHS = [p for p in CHUNK_TRAIN_PATHS if os.path.exists(p)]
-if not CHUNK_TRAIN_PATHS:
-    raise FileNotFoundError("Nessun chunk trovato nei path configurati.")
+        # Linear projections
+        Qe = self.Wq(meta_tokens)    # queries from metadata
+        Ke = self.Wk(bert_hidden)    # keys from text
 
-# =========================
-# Load datasets
-# =========================
-print("🔄 Loading datasets...")
-if "bert" in model_name:
-    raw_dataset = concatenate_datasets([load_from_disk(p) for p in CHUNK_TRAIN_PATHS])
-    split = raw_dataset.train_test_split(test_size=0.1, seed=args.seed, stratify_by_column="label")
-    train_dataset = split['train']
-    val_dataset   = split['test']
-else:
-    # qt5 generativo: concatena SOLO train e split 90/10 stratificato
-    train_datasets = [load_from_disk(p) for p in CHUNK_TRAIN_PATHS]
-    raw_dataset = concatenate_datasets(train_datasets)
-    split = raw_dataset.train_test_split(test_size=0.1, seed=args.seed, stratify_by_column="label")
-    train_dataset = split['train']
-    val_dataset   = split['test']
+        # Compute additive attention scores: v^T tanh(Q + K)
+        Qe_exp = Qe.unsqueeze(2).expand(-1, -1, L, -1)  # [B, M, L, A]
+        Ke_exp = Ke.unsqueeze(1).expand(-1, M, -1, -1)  # [B, M, L, A]
+        e_ij = torch.tanh(Qe_exp + Ke_exp)
+        scores = self.v(e_ij).squeeze(-1)               # [B, M, L]
 
-# =========================
-# Dataset wrapper
-# =========================
-class HFTokenizedDataset(Dataset):
-    def __init__(self, hf_dataset, for_qt5_decoder=False):
-        self.dataset = hf_dataset
-        self.for_qt5_decoder = for_qt5_decoder
+        # Apply mask to ignore padding tokens
+        if bert_attn_mask is not None:
+            mask = (bert_attn_mask == 1).unsqueeze(1).expand(-1, M, -1)
+            scores = scores.masked_fill(~mask, float('-inf'))
 
-    def __len__(self):
-        return len(self.dataset)
+        # Normalize into attention weights
+        attn = torch.softmax(scores, dim=-1)            # [B, M, L]
 
-    def __getitem__(self, idx):
-        item = self.dataset[idx]
-        numerics = item['numerics'] if item.get('numerics') is not None and all(v is not None for v in item['numerics']) else [0.0]*8
+        # Weighted sum of textual values projected into metadata space
+        Vproj = self.Vv(bert_hidden)                    # [B, L, H]
+        context = torch.bmm(attn, Vproj)                # [B, M, H]
 
-        sample = {
-            'input_ids':        torch.tensor(item['input_ids'], dtype=torch.long),
-            'attention_mask':   torch.tensor(item['attention_mask'], dtype=torch.long),
-            'anchor_out_ids':   torch.tensor(item['anchor_out_ids'], dtype=torch.long),
-            'anchor_out_mask':  torch.tensor(item['anchor_out_mask'], dtype=torch.long),
-            'anchor_in_ids':    torch.tensor(item['anchor_in_ids'], dtype=torch.long),
-            'anchor_in_mask':   torch.tensor(item['anchor_in_mask'], dtype=torch.long),
-            'domains_out_ids':  torch.tensor(item['domains_out_ids'], dtype=torch.long),
-            'domains_in_ids':   torch.tensor(item['domains_in_ids'], dtype=torch.long),
-            'numerics':         torch.tensor(numerics, dtype=torch.float32),
-            'label':            torch.tensor(int(item['label']), dtype=torch.float32),
-        }
+        # Residual connection + layer normalization
+        out = self.norm(meta_tokens + self.dropout(context))
+        return out
 
-        # per qt5_decoder: usa decoder_labels dal dataset se presenti, altrimenti ricostruisci
-        if self.for_qt5_decoder:
-            if 'decoder_labels' in item and item['decoder_labels'] is not None and len(item['decoder_labels']) > 0:
-                sample['decoder_labels'] = torch.tensor(item['decoder_labels'], dtype=torch.long)
-            else:
-                label_str = "true" if int(item["label"]) == 1 else "false"
-                tokenized = tokenizer(label_str, return_tensors="pt").input_ids[0]
-                sample['decoder_labels'] = tokenized.long()  # includiamo tutto
-        else:
-            # qt5 generativo “small”: se esiste decoder_labels, mantienila per training T5
-            if 'decoder_labels' in item and item['decoder_labels'] is not None and len(item['decoder_labels']) > 0:
-                sample['decoder_labels'] = torch.tensor(item['decoder_labels'], dtype=torch.long)
 
-        return sample
+class MultiModalWebClassifier(nn.Module):
+    """
+    A multimodal classifier that integrates:
+      1. Textual representations from a pre-trained Transformer (BERT).
+      2. Structural/contextual metadata (anchors, domains, numeric stats).
+      3. A unified attention mechanism to let metadata tokens attend over text.
+    Final prediction is binary relevance of a candidate link.
+    """
+    def __init__(self, encoder: BertModel, hidden_dim=HIDDEN_DIM, use_lora=False):
+        super().__init__()
+        self.encoder = encoder
 
-# =========================
-# Model import
-# =========================
-if model_name == "qt5_small":
-    print("passo da qualt5 decoder")
-    # adatta al tuo path/modulo
-    from model.model_qualt5_decoder import MultiModalWebClassifier  # noqa
-elif model_name.startswith("pyterrier-quality/qt5-small"):
-    # adatta al tuo path/modulo
-    from model.model_qualt5_decoder import MultiModalWebClassifier  # noqa
-else:
-    from model.model_bert import MultiModalWebClassifier  # noqa
+        # Domain-level categorical metadata embedded in the same space
+        self.domains_embedding = nn.Embedding(30522, 64)
 
-# =========================
-# Dataloaders
-# =========================
-BATCH_SIZE_P1 = 256 if "bert" in model_name else 64
-BATCH_SIZE_P2 = 32
+        # Metadata encoder + cross-modal attention
+        self.meta_encoder = MetadataEncoder(hidden_dim)
+        self.uni_attn     = AdditiveUniAttention(meta_h=hidden_dim, txt_h=BERT_H, attn_h=64)
 
-train_loader = DataLoader(
-    HFTokenizedDataset(train_dataset, for_qt5_decoder=(model_name=="qt5_decoder")),
-    batch_size=BATCH_SIZE_P1, shuffle=True, pin_memory=True
-)
-val_loader   = DataLoader(
-    HFTokenizedDataset(val_dataset,   for_qt5_decoder=(model_name=="qt5_decoder")),
-    batch_size=BATCH_SIZE_P1, shuffle=False, pin_memory=True
-)
+        # Classification head: combines text [CLS] + enriched metadata
+        self.head = nn.Sequential(
+            nn.Linear(hidden_dim + BERT_H, 128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, 1)  # binary logit
+        )
 
-# =========================
-# Class weight (solo per BERT)
-# =========================
-if "bert" in model_name:
-    labels = [int(x) for x in train_dataset["label"]]
-    pos = sum(labels)
-    neg = len(labels) - pos
-    pos_weight_val = (neg / max(pos, 1))
-    pos_weight = torch.tensor([pos_weight_val], dtype=torch.float32)
-    print(f"🔢 Computed pos_weight: {pos_weight_val:.4f}")
-else:
-    pos_weight = None
+    def forward(self, input_ids, attention_mask,
+                anchor_out_ids, anchor_in_ids,
+                anchor_out_mask, anchor_in_mask,
+                domains_out_ids, domains_in_ids,
+                numerics):
 
-# =========================
-# Build model
-# =========================
-if "bert" in model_name:
-    model = MultiModalWebClassifier(encoder)
-else:
-    model = MultiModalWebClassifier()
+        # (1) Encode textual content with Transformer
+        enc = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
+        last_hidden = enc.last_hidden_state               # contextualized sequence [B, L, 768]
+        cls = last_hidden[:, 0]                           # [CLS] token embedding [B, 768]
 
-# =========================
-# LoRA (solo per BERT encoder, opzionale)
-# =========================
-def apply_lora_to_bert_encoder(bert_encoder):
-    from peft import LoraConfig, get_peft_model
-    target_names = []
-    for name, module in bert_encoder.named_modules():
-        lname = name.lower()
-        if ("encoder.layer" in lname) and (
-            lname.endswith("attention.self.query") or
-            lname.endswith("attention.self.key") or
-            lname.endswith("attention.self.value")
-        ):
-            target_names.append(name)
+        # (2) Encode domain lists with masked mean pooling
+        def masked_mean(emb, ids):
+            mask = (ids != 0).unsqueeze(-1)
+            emb = emb * mask
+            return emb.sum(1) / mask.sum(1).clamp(min=1e-6)
 
-    lconf = LoraConfig(
-        r=8, lora_alpha=16,
-        target_modules=target_names,
-        lora_dropout=0.05,
-        bias="none",
-    )
-    peft_encoder = get_peft_model(bert_encoder, lconf)
-    peft_encoder.print_trainable_parameters()
-    return peft_encoder
+        dom_out = masked_mean(self.domains_embedding(domains_out_ids), domains_out_ids)
+        dom_in  = masked_mean(self.domains_embedding(domains_in_ids),  domains_in_ids)
 
-# =========================
-# Optim/loss helpers
-# =========================
-def make_optimizer(model, lr, weight_decay=0.01):
-    decay, no_decay = [], []
-    for n, p in model.named_parameters():
-        if not p.requires_grad:
-            continue
-        if any(nd in n for nd in ["bias", "LayerNorm.weight", "layer_norm.weight"]):
-            no_decay.append(p)
-        else:
-            decay.append(p)
-    return torch.optim.AdamW(
-        [{"params": decay, "weight_decay": weight_decay},
-         {"params": no_decay, "weight_decay": 0.0}],
-        lr=lr
-    )
+        # (3) Encode metadata and refine with cross-modal attention
+        meta_tokens = self.meta_encoder(anchor_out_ids, anchor_in_ids, dom_out, dom_in, numerics)  # [B, 5, H]
+        attn_out = self.uni_attn(meta_tokens, last_hidden, attention_mask)                         # [B, 5, H]
+        meta_vec = attn_out.mean(dim=1)                                                            # aggregate [B, H]
 
-if "bert" in model_name:
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-else:
-    criterion = None  # T5 gestisce la loss con labels
-
-# =========================
-# Accelerator prepare
-# =========================
-optimizer = make_optimizer(model, lr=1e-3)
-if "bert" in model_name:
-    model, optimizer, train_loader, val_loader, criterion = accelerator.prepare(
-        model, optimizer, train_loader, val_loader, criterion
-    )
-else:
-    model, optimizer, train_loader, val_loader = accelerator.prepare(
-        model, optimizer, train_loader, val_loader
-    )
-
-# =========================
-# W&B
-# =========================
-wandb.init(project="multimodal-web-classifier",
-           name=f"{short_model}-metadata",
-           config={
-               "base_model": model_name,
-               "batch_size_p1": BATCH_SIZE_P1,
-               "batch_size_p2": BATCH_SIZE_P2,
-               "pos_weight": (float(pos_weight.detach().cpu().item()) if pos_weight is not None else None)
-           })
-
-# =========================
-# Eval
-# =========================
-def run_eval_bert(model, val_loader, criterion):
-    model.eval()
-    val_loss, correct, total = 0.0, 0, 0
-    with torch.no_grad():
-        for batch in val_loader:
-            outputs = model(**{k: v for k, v in batch.items() if k != "label"})
-            loss = criterion(outputs, batch["label"])
-            val_loss += loss.item()
-            preds = (outputs > 0.0).long()  # logits threshold 0.0 == sigmoid>0.5
-            correct += (preds == batch["label"].long()).sum().item()
-            total   += batch["label"].size(0)
-    return (val_loss / max(len(val_loader), 1)), (correct / max(total, 1))
-
-def run_eval_qt5(model, val_loader):
-    model.eval()
-    correct, total = 0, 0
-    with torch.no_grad():
-        for batch in val_loader:
-            batch = {k: v.to(device) for k, v in batch.items()}
-            enc_out = model.model.encoder(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"]
-            )
-            enc_hidden = enc_out.last_hidden_state
-
-            dom_out = model.domains_embedding(batch['domains_out_ids']).mean(dim=1)
-            dom_in  = model.domains_embedding(batch['domains_in_ids']).mean(dim=1)
-            meta_tokens = model.meta_encoder(
-                batch['anchor_out_ids'], batch['anchor_in_ids'],
-                dom_out, dom_in, batch['numerics']
-            )
-            enc_mask = batch['attention_mask']
-            if enc_mask.dtype != torch.bool:
-                enc_mask = enc_mask.bool()
-            enc_mask = batch["attention_mask"]
-            if enc_mask.dtype != torch.bool:
-                enc_mask = enc_mask.bool()
-            uni_out = model.uni_attn(meta_tokens, enc_hidden, enc_mask)
-            prompt = model.prompt_mapper(uni_out.mean(dim=1)).unsqueeze(1)  # (B,1,H)
-
-            # Decodifica 1 token: 'true'/'false' è un singolo token nella pratica
-            out = model.model(
-                encoder_outputs=BaseModelOutput(last_hidden_state=enc_hidden),
-                decoder_inputs_embeds=prompt,
-                return_dict=True
-            )
-            logits = out.logits                      # (B,1,V)
-            pred_token_ids = torch.argmax(logits, dim=-1)  # (B,1)
-            pred_text = tokenizer.batch_decode(pred_token_ids, skip_special_tokens=True)
-            preds = torch.tensor([1 if p.strip().lower()=="true" else 0 for p in pred_text], device=device)
-
-            correct += (preds == batch['label'].long()).sum().item()
-            total   += batch['label'].size(0)
-
-    val_acc = correct / max(total, 1)
-    return 0.0, val_acc
-
-# =========================
-# Train phase
-# =========================
-def train_phase_bert(model, train_loader, val_loader, epochs, lr, max_steps, freeze_encoder=True, use_lora=False):
-    # Freeze encoder
-    for p in model.encoder.parameters():
-        p.requires_grad = not freeze_encoder
-
-    # LoRA SOLO encoder
-    if use_lora:
-        accelerator.wait_for_everyone()
-        model.encoder = apply_lora_to_bert_encoder(model.encoder)
-        model = accelerator.prepare(model)
-
-    optimizer = make_optimizer(model, lr=lr)
-    optimizer = accelerator.prepare(optimizer)
-
-    best_val = float("inf")
-    for epoch in range(epochs):
-        model.train()
-        running = 0.0
-        steps_this_epoch = 0
-
-        with tqdm(total=min(max_steps, len(train_loader)),
-                  desc=f"Epoch {epoch+1}",
-                  disable=not accelerator.is_local_main_process) as pbar:
-            for batch in train_loader:
-                if steps_this_epoch >= max_steps:
-                    break
-                optimizer.zero_grad(set_to_none=True)
-                outputs = model(**{k: v for k, v in batch.items() if k != "label"})
-                loss = criterion(outputs, batch["label"])
-                accelerator.backward(loss)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
-
-                running += loss.item()
-                steps_this_epoch += 1
-                pbar.update(1)
-
-        val_loss, val_acc = run_eval_bert(model, val_loader, criterion)
-        train_loss = running / max(1, min(max_steps, len(train_loader)))
-
-        if accelerator.is_local_main_process:
-            wandb.log({"epoch": epoch + 1, "train_loss": train_loss, "val_loss": val_loss, "val_accuracy": val_acc})
-            print(f"[Epoch {epoch+1}] Train {train_loss:.4f} | Val {val_loss:.4f} | Acc {val_acc:.4f}")
-
-            if val_loss < best_val:
-                best_val = val_loss
-                accelerator.save(model.state_dict(), f"best_model_{short_model}.pt")
-    return model
-
-def train_phase_qt5(model, train_loader, val_loader, epochs, lr, max_steps):
-    optimizer = make_optimizer(model, lr=lr)
-    optimizer = accelerator.prepare(optimizer)
-
-    best_val_acc = 0.0
-    global_step = 0
-
-    for epoch in range(epochs):
-        model.train()
-        running = 0.0
-
-        loader_iter = iter(train_loader)
-        with tqdm(total=min(max_steps, len(train_loader)), desc=f"Epoch {epoch+1}", disable=not accelerator.is_local_main_process) as pbar:
-            while global_step < max_steps:
-                try:
-                    batch = next(loader_iter)
-                except StopIteration:
-                    break
-
-                batch = {k: v.to(device) for k, v in batch.items()}
-                optimizer.zero_grad(set_to_none=True)
-
-                # Encoder
-                enc_out = model.model.encoder(
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"]
-                )
-                enc_hidden = enc_out.last_hidden_state
-
-                # Metadata fusion
-                dom_out = model.domains_embedding(batch['domains_out_ids']).mean(dim=1)
-                dom_in  = model.domains_embedding(batch['domains_in_ids']).mean(dim=1)
-                meta_tokens = model.meta_encoder(
-                    batch['anchor_out_ids'], batch['anchor_in_ids'],
-                    dom_out, dom_in, batch['numerics']
-                )
-               # uni_out = model.uni_attn(meta_tokens, enc_hidden)
-                enc_mask = batch["attention_mask"]
-                if enc_mask.dtype != torch.bool:
-                    enc_mask = enc_mask.bool()
-                uni_out = model.uni_attn(meta_tokens, enc_hidden, enc_mask)
-
-                # Labels del decoder
-                labels = batch['decoder_labels'].view(batch['decoder_labels'].size(0), -1).long()
-
-                # Prompt: espandi alla stessa lunghezza delle labels
-                prompt = model.prompt_mapper(uni_out.mean(dim=1)).unsqueeze(1).expand(-1, labels.size(1), -1)
-
-                out = model.model(
-                    encoder_outputs=BaseModelOutput(last_hidden_state=enc_hidden),
-                    decoder_inputs_embeds=prompt,
-                    labels=labels,
-                    return_dict=True
-                )
-                loss = out.loss
-
-                accelerator.backward(loss)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
-
-                running += loss.item()
-                global_step += 1
-                pbar.update(1)
-
-        _, val_acc = run_eval_qt5(model, val_loader)
-        train_loss = running / max(1, min(max_steps, len(train_loader)))
-
-        if accelerator.is_local_main_process:
-            wandb.log({"epoch": epoch + 1, "train_loss": train_loss, "val_accuracy": val_acc})
-            print(f"[Epoch {epoch+1}] Train {train_loss:.4f} | Val Acc {val_acc:.4f}")
-
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                accelerator.save(model.state_dict(), f"best_model_{short_model}.pt")
-    return model
-
-# =========================
-# Run
-# =========================
-if "bert" in model_name:
-    # Phase 1: freeze encoder
-    model = train_phase_bert(model, train_loader, val_loader,
-                             epochs=2, lr=1e-3, max_steps=args.max_steps_p1,
-                             freeze_encoder=True, use_lora=False)
-
-    # Phase 2: unfreeze + LoRA SOLO encoder (opzionale)
-    train_loader_p2 = DataLoader(HFTokenizedDataset(train_dataset), batch_size=BATCH_SIZE_P2, shuffle=True, pin_memory=True)
-    val_loader_p2   = DataLoader(HFTokenizedDataset(val_dataset),   batch_size=BATCH_SIZE_P2, shuffle=False,pin_memory=True)
-    train_loader_p2, val_loader_p2 = accelerator.prepare(train_loader_p2, val_loader_p2)
-
-    model = train_phase_bert(model, train_loader_p2, val_loader_p2,
-                             epochs=1, lr=1e-4, max_steps=args.max_steps_p2,
-                             freeze_encoder=False, use_lora=True)
-else:
-    # QT5 generativo
-    model = train_phase_qt5(model, train_loader, val_loader,
-                            epochs=2, lr=1e-3, max_steps=args.max_steps_p1)
-
-# Save finale
-if accelerator.is_local_main_process:
-    accelerator.save(model.state_dict(), f"best_model_{short_model}.pt")
-    print("✅ Done. Saved:", f"best_model_{short_model}.pt")
+        # (4) Fuse CLS + metadata vector → classification head
+        combined = torch.cat([cls, meta_vec], dim=-1)  # [B, 768+H]
+        logits = self.head(combined).squeeze(-1)       # [B]
+        return logits
