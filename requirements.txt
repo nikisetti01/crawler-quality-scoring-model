@@ -1,0 +1,22 @@
+# Core scientific stack
+numpy
+pandas
+scikit-learn
+matplotlib
+tqdm
+
+# Deep learning
+torch
+transformers
+datasets
+sentencepiece   # richiesto da T5 / QualT5
+
+# Experiment tracking
+wandb
+
+# Crawling / evaluation integration
+pyterrier
+pyterrier-quality
+
+# Utilities
+argparse
