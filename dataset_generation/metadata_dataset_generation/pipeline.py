@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import subprocess
 
-# 🔧 CONFIGURA qui i path
+# 🔧Configuration 
 JSON_INLINK_DIR  = "/app/data/inlink_json"
 JSON_OUTLINK_DIR = "/app/data/outlink_json"
 BASE_CSV         = "/app/data/results/dataset_test.csv"
@@ -12,7 +12,7 @@ SORTED_INLINK = "inlink_sorted.csv"
 SORTED_OUTLINK = "outlink_sorted.csv"
 JOINED = "joined.csv"
 
-# 1) Estrazione metadati
+# 1) Metadata extraction
 subprocess.run([
     "python3", "extract_metadata.py",
     "--mode", "inlink",
@@ -40,14 +40,14 @@ subprocess.run([
     "--output", SORTED_OUTLINK
 ], check=True)
 
-# 3) Join finale
+# 3) Final Join
 subprocess.run([
     "python3", "join.py",
     "--base", BASE_CSV,
     "--inlink", SORTED_INLINK,
     "--outlink", SORTED_OUTLINK,
     "--output", JOINED,
-    "--intersect"   # toglilo se vuoi anche le righe non presenti ovunque
+    "--intersect"   
 ], check=True)
 
-print("✅ Pipeline completata, output:", JOINED)
+print("✅ Pipeline completed, output:", JOINED)
