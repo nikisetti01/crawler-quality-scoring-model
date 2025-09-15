@@ -31,4 +31,17 @@ The repository addresses the following RQs from the thesis:
 
 ## 📂 Repository Structure
 The code is organised by experimental phase. For a detailed description of structure and reproducibility guidelines, **see Chapter 7 (“Code and Implementation”) of the thesis**.
+---
+
+## 📚 Citation
+If you use this code, please cite:
+
+```bibtex
+@mastersthesis{settimelli2025,
+  title     = {Learning What to Crawl: Metadata-Enriched LLMs for Crawling Frontier Prioritisation},
+  author    = {Niccolò Settimelli},
+  year      = {2025},
+  school    = {University of Pisa},
+  type      = {MSc Thesis}
+}
 
