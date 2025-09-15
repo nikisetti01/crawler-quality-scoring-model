@@ -15,7 +15,7 @@ The main contributions are:
 - Moving from **page-centric quality estimation** to **outlink utility prediction**.  
 - Designing and fine-tuning **LLM-based models** for binary classification and score estimation.  
 - Extending models with **metadata fusion** (anchors, domains, numeric link features).  
-- Integrating predictions into a **crawler simulation framework** and benchmarking against BFS, DFS, and PageRank.
+
 
 ---
 
