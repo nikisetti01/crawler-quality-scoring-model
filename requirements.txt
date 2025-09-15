@@ -9,7 +9,7 @@ tqdm
 torch
 transformers
 datasets
-sentencepiece   # richiesto da T5 / QualT5
+sentencepiece   # request for T5 / QualT5
 
 # Experiment tracking
 wandb

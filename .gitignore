@@ -2,3 +2,4 @@
 # Ignore CSV files
 *.csv
 results/results_QualT5_eval.csv
+*.png

@@ -53,7 +53,7 @@ val_dataset = val_dataset.map(format_prompt)
 test_dataset = test_dataset.map(format_prompt)
 
 # Load tokenizer (QualT5 variant from Hugging Face Hub)
-model_name = "pyterrier-quality/qt5-tiny"
+model_name = "pyterrier-quality/qt5-small"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 
 # Tokenization function for input/target

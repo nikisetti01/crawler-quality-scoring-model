@@ -18,7 +18,7 @@ parser.add_argument("--model_name", type=str, default="bert-base-uncased",
 parser.add_argument("--ckpt", type=str, required=True,
                     help="Path to .pt checkpoint")
 parser.add_argument("--input_csv", type=str, required=True,
-                    help="Input TSV/CSV (uses sep inferred or force with --sep)")
+                    help="Input TSV/CSV (separator inferred or forced with --sep)")
 parser.add_argument("--sep", type=str, default="\t", help="Field separator (default: TAB)")
 parser.add_argument("--output_csv", type=str, required=True,
                     help="Output CSV with predictions")
@@ -28,10 +28,10 @@ parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_availa
 args = parser.parse_args()
 
 DEVICE = torch.device(args.device)
-print(f"✅ Device: {DEVICE}")
+print(f"[INFO] Using device: {DEVICE}")
 
 # -----------------------------
-# Column mapping (15-col header)
+# Column mapping
 # -----------------------------
 NUM_COLS = [
     'num_inlinks','length_inlinks','inlinks_domains_count','inlink_slashes_count',
@@ -55,10 +55,10 @@ except Exception:
 # -----------------------------
 def remap_state_dict_for_plain_encoder(state):
     """
-    - Rimuove prefisso 'encoder.base_model.model.' -> 'encoder.'
-    - Rimuove '.base_layer.' (alcuni wrapper LoRA)
-    - Scarta chiavi LoRA ('.lora_A.' / '.lora_B.')
-    Restituisce un nuovo state_dict caricabile con strict=False.
+    - Remove prefix 'encoder.base_model.model.' -> 'encoder.'
+    - Remove '.base_layer.' (LoRA wrappers)
+    - Drop LoRA keys ('.lora_A.' / '.lora_B.')
+    Returns a remapped state_dict loadable with strict=False.
     """
     remapped, drop = {}, 0
     for k, v in state.items():
@@ -70,46 +70,42 @@ def remap_state_dict_for_plain_encoder(state):
             drop += 1
             continue
         remapped[k2] = v
-    print(f"[INFO] remap: kept={len(remapped)} dropped_lora={drop}")
+    print(f"[INFO] remap: kept={len(remapped)} dropped={drop} (LoRA)")
     return remapped
 
 def load_checkpoint_into_model(model, ckpt_path):
-    # torch warning consiglia weights_only=True (se disponibile)
     try:
         state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     except TypeError:
         state = torch.load(ckpt_path, map_location="cpu")
-    # Se è un dict con 'state_dict' dentro (alcuni trainer salvano così)
     if isinstance(state, dict) and "state_dict" in state and len(state) <= 2:
         state = state["state_dict"]
 
-    # Prova a caricare diretto
     try:
         missing, unexpected = model.load_state_dict(state, strict=False)
-        print(f"[INFO] direct load: missing={len(missing)} unexpected={len(unexpected)}")
+        print(f"[INFO] checkpoint loaded (direct): missing={len(missing)} unexpected={len(unexpected)}")
         return
     except Exception as e:
-        print(f"[WARN] direct load failed: {e}\n[INFO] trying remap LoRA/prefix...")
+        print(f"[WARN] direct load failed: {e}\n[INFO] trying remap...")
 
-    # Remap LoRA/prefix
     remapped = remap_state_dict_for_plain_encoder(state)
     missing, unexpected = model.load_state_dict(remapped, strict=False)
-    print(f"[INFO] remap load: missing={len(missing)} unexpected={len(unexpected)}")
+    print(f"[INFO] checkpoint loaded (remap): missing={len(missing)} unexpected={len(unexpected)}")
     if missing:
-        print(f"[DEBUG] missing (first 20): {missing[:20]}")
+        print(f"[DEBUG] missing keys (first 20): {missing[:20]}")
     if unexpected:
-        print(f"[DEBUG] unexpected (first 20): {unexpected[:20]}")
+        print(f"[DEBUG] unexpected keys (first 20): {unexpected[:20]}")
 
 # -----------------------------
 # Tokenizer/Encoder/Model
 # -----------------------------
-print("🧠 Building encoder/tokenizer...")
+print("[INFO] Initializing encoder and tokenizer...")
 tok = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
 encoder = AutoModel.from_pretrained(args.model_name)
 model = MultiModalWebClassifier(encoder).to(DEVICE)
-print(f"📦 Loading checkpoint: {args.ckpt}")
+print(f"[INFO] Loading checkpoint from {args.ckpt}")
 load_checkpoint_into_model(model, args.ckpt)
-print(f"dataset path: {args.input_csv}")
+print(f"[INFO] Input dataset: {args.input_csv}")
 model.eval()
 sigmoid = nn.Sigmoid()
 
@@ -118,12 +114,10 @@ sigmoid = nn.Sigmoid()
 # -----------------------------
 def ensure_cols(df: pd.DataFrame) -> pd.DataFrame:
     if 'text' not in df.columns:
-        raise ValueError("Input deve contenere la colonna 'text'.")
-    # numerics
+        raise ValueError("Input must contain a 'text' column.")
     for c in NUM_COLS:
         if c not in df.columns:
             df[c] = 0.0
-    # anchors/domains
     for c in (ANCHOR_IN_COL, ANCHOR_OUT_COL, DOM_IN_LIST, DOM_OUT_LIST):
         if c not in df.columns:
             df[c] = ""
@@ -132,7 +126,6 @@ def ensure_cols(df: pd.DataFrame) -> pd.DataFrame:
                 df[c] = df[c].fillna("").astype(str).str.replace(";", " ").str.replace("|", " ")
             else:
                 df[c] = df[c].fillna("").astype(str)
-    # opzionali id/url/label
     for c in ("clueweb_id", "url"):
         if c not in df.columns:
             df[c] = ""
@@ -148,7 +141,6 @@ class InferenceDataset(Dataset):
 
     def __getitem__(self, i):
         r = self.df.iloc[i]
-        # tokenizzazioni (come nel train)
         te = tok(str(r["text"]), truncation=True, padding="max_length", max_length=512, return_tensors="pt")
         ao = tok(str(r[ANCHOR_OUT_COL]), truncation=True, padding="max_length", max_length=32, return_tensors="pt")
         ai = tok(str(r[ANCHOR_IN_COL]),  truncation=True, padding="max_length", max_length=32, return_tensors="pt")
@@ -211,9 +203,9 @@ with torch.no_grad():
 
         rows, labels_buf = [], []
 
-        for batch in tqdm(dl, desc="🔍 Inference (BERT)"):
+        for batch in tqdm(dl, desc="Inference"):
             inputs = {k: v.to(DEVICE) for k, v in batch.items() if not k.startswith("_")}
-            logits = model(**inputs)  # (B,)
+            logits = model(**inputs)
             probs  = torch.sigmoid(logits).detach().cpu().numpy().tolist()
             preds  = (np.array(probs) >= 0.5).astype(int).tolist()
 
@@ -235,6 +227,6 @@ with torch.no_grad():
             first = False
             written += len(out_df)
             rows_seen += len(chunk)
-            print(f"[CKPT] processed~={rows_seen:,} written={written:,} → {args.output_csv}")
+            print(f"[INFO] processed={rows_seen:,} written={written:,} → {args.output_csv}")
 
-print(f"[DONE] Total written: {written:,} rows → {args.output_csv}")
+print(f"[DONE] Total rows written: {written:,} → {args.output_csv}")

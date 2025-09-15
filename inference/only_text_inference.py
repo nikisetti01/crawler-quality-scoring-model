@@ -8,14 +8,17 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 from tqdm import tqdm
 
+# -----------------------------
+# Args
+# -----------------------------
 parser = argparse.ArgumentParser()
 parser.add_argument("--model_path", type=str, required=True,
-                    help="HuggingFace path o dir locale dello checkpoint QualT5")
+                    help="HuggingFace path or local dir of the QualT5 checkpoint")
 parser.add_argument("--input_csv", type=str, required=True,
-                    help="Input TSV/CSV con almeno la colonna 'text'")
+                    help="Input TSV/CSV with at least a 'text' column")
 parser.add_argument("--output_csv", type=str, required=True,
-                    help="Output CSV con [clueweb_id,url,score,pred(,label)]")
-parser.add_argument("--sep", type=str, default="\t", help="Separatore (default: TAB)")
+                    help="Output CSV with [clueweb_id,url,score,pred(,label)]")
+parser.add_argument("--sep", type=str, default="\t", help="Field separator (default: TAB)")
 parser.add_argument("--batch_size", type=int, default=256)
 parser.add_argument("--chunksize", type=int, default=200_000)
 parser.add_argument("--max_length", type=int, default=512)
@@ -23,17 +26,17 @@ parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_availa
 args = parser.parse_args()
 
 DEVICE = torch.device(args.device)
-print(f"✅ Device: {DEVICE}")
+print(f"[INFO] Using device: {DEVICE}")
 
 # -----------------------------
-# Tokenizer/Model
+# Tokenizer / Model
 # -----------------------------
-print("🧠 Loading QualT5 tokenizer & model...")
+print("[INFO] Loading QualT5 tokenizer and model...")
 tokenizer = AutoTokenizer.from_pretrained(args.model_path)
 model = AutoModelForSeq2SeqLM.from_pretrained(args.model_path).to(DEVICE)
 model.eval()
 
-# Mappa robusta dei token "true"/"false" (sentencepiece può usare l'underscore basso)
+# Robust mapping for "true"/"false" (SentencePiece variants may include leading underscores)
 CAND_TRUE = ["▁true", "true", "Ġtrue", "<true>"]
 CAND_FALSE = ["▁false", "false", "Ġfalse", "<false>"]
 
@@ -47,19 +50,19 @@ def find_token_id(tok, candidates):
 true_id, true_str = find_token_id(tokenizer, CAND_TRUE)
 false_id, false_str = find_token_id(tokenizer, CAND_FALSE)
 if true_id is None or false_id is None:
-    raise ValueError(f"Token 'true'/'false' non trovati nel vocab. Trovato true={true_str}, false={false_str}")
+    raise ValueError(f"'true'/'false' tokens not found. Found true={true_str}, false={false_str}")
 
-print(f"🔎 Using true_token={true_str}({true_id}), false_token={false_str}({false_id})")
+print(f"[INFO] Using tokens: true={true_str}({true_id}), false={false_str}({false_id})")
 
 # -----------------------------
-# Dataset/Collate
+# Dataset / Collate
 # -----------------------------
 REQ_COL = "text"
 
 def ensure_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure required/optional columns exist and are well-typed."""
     if REQ_COL not in df.columns:
-        raise ValueError(f"L'input deve contenere la colonna '{REQ_COL}'.")
-    # opzionali
+        raise ValueError(f"Input must contain a '{REQ_COL}' column.")
     for c in ("clueweb_id", "url"):
         if c not in df.columns:
             df[c] = ""
@@ -69,12 +72,14 @@ def ensure_cols(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 class QTDataset(Dataset):
+    """Simple dataset for QualT5 seq2seq scoring from raw text."""
     def __init__(self, df: pd.DataFrame, tok: AutoTokenizer, max_len: int):
         self.df = df.reset_index(drop=True)
         self.tok = tok
         self.max_len = max_len
 
-    def __len__(self): return len(self.df)
+    def __len__(self): 
+        return len(self.df)
 
     def __getitem__(self, i):
         r = self.df.iloc[i]
@@ -95,6 +100,7 @@ class QTDataset(Dataset):
         return out
 
 def collate_fn(batch):
+    """Stack tensors and keep ids/urls/labels as side fields."""
     out = {
         "input_ids": torch.stack([b["input_ids"] for b in batch]),
         "attention_mask": torch.stack([b["attention_mask"] for b in batch]),
@@ -112,24 +118,25 @@ os.makedirs(os.path.dirname(args.output_csv), exist_ok=True)
 first = True
 written = 0
 rows_seen = 0
-printed_preview=0
-print(f"📄 Input: {args.input_csv}")
+printed_preview = 0
+
+print(f"[INFO] Input file: {args.input_csv}")
 reader = pd.read_csv(args.input_csv, sep=args.sep, chunksize=args.chunksize)
 
 with torch.no_grad():
     for chunk in reader:
         chunk = ensure_cols(chunk)
         ds = QTDataset(chunk, tokenizer, args.max_length)
-        dl = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=1,
-                        pin_memory=True, collate_fn=collate_fn)
+        dl = DataLoader(ds, batch_size=args.batch_size, shuffle=False,
+                        num_workers=1, pin_memory=True, collate_fn=collate_fn)
 
         rows, labels_buf = [], []
 
-        for batch in tqdm(dl, desc="🔍 Inference (QualT5)"):
+        for batch in tqdm(dl, desc="Inference (QualT5)"):
             input_ids = batch["input_ids"].to(DEVICE, non_blocking=True)
             attention_mask = batch["attention_mask"].to(DEVICE, non_blocking=True)
 
-            # Logits del primo step decoder (pos=0)
+            # Decoder first-step logits (position 0)
             dec_start = torch.full(
                 (input_ids.size(0), 1),
                 model.config.decoder_start_token_id,
@@ -141,10 +148,10 @@ with torch.no_grad():
                 decoder_input_ids=dec_start,
                 return_dict=True
             )
-            logits_step0 = outputs.logits[:, 0, :]  # [B, V]
-            probs = torch.softmax(logits_step0, dim=-1)  # [B, V]
+            logits_step0 = outputs.logits[:, 0, :]        # [B, V]
+            probs = torch.softmax(logits_step0, dim=-1)    # [B, V]
 
-            # Normalizzazione su soli {true,false}
+            # Normalize over {true, false} only
             denom = probs[:, true_id] + probs[:, false_id] + 1e-12
             scores = (probs[:, true_id] / denom).detach().cpu().numpy().tolist()
             preds = (np.array(scores) >= 0.5).astype(int).tolist()
@@ -155,13 +162,13 @@ with torch.no_grad():
                 for cid, url, s, p, lab in zip(batch["_ids"], batch["_urls"], scores, preds, labs):
                     rows.append((cid, url, s, p, lab))
                     if printed_preview < 5:
-                        print(f"  [P] id={cid} url={url} score={s:.4f} pred={p} label={lab}")
+                        print(f"[PREVIEW] id={cid} score={s:.4f} pred={p} label={lab} url={url}")
                         printed_preview += 1
             else:
                 for cid, url, s, p in zip(batch["_ids"], batch["_urls"], scores, preds):
                     rows.append((cid, url, s, p))
                     if printed_preview < 5:
-                        print(f"  [P] id={cid} url={url} score={s:.4f} pred={p}")
+                        print(f"[PREVIEW] id={cid} score={s:.4f} pred={p} url={url}")
                         printed_preview += 1
 
         if rows:
@@ -173,6 +180,6 @@ with torch.no_grad():
             first = False
             written += len(out_df)
             rows_seen += len(chunk)
-            print(f"[CKPT] processed~={rows_seen:,} written={written:,} → {args.output_csv}")
+            print(f"[INFO] processed={rows_seen:,} written={written:,} → {args.output_csv}")
 
-print(f"[DONE] Total written: {written:,} rows → {args.output_csv}")
+print(f"[DONE] Total rows written: {written:,} → {args.output_csv}")
