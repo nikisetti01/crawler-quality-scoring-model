@@ -32,7 +32,9 @@ The repository addresses the following RQs from the thesis:
 ## 📂 Repository Structure
 The code is organised by experimental phase. For a detailed description of structure and reproducibility guidelines, **see Chapter 7 (“Code and Implementation”) of the thesis**.
 ---
+## 📌 License
 
+This project is licensed under the **MIT License** – see the [LICENSE](LICENSE) file for details.
 ## 📚 Citation
 If you use this code, please cite:
 
@@ -44,7 +46,5 @@ If you use this code, please cite:
   school    = {University of Pisa},
   type      = {MSc Thesis}
 }
-## 📌 License
 
-This project is licensed under the **MIT License** – see the [LICENSE](LICENSE) file for details.
 
